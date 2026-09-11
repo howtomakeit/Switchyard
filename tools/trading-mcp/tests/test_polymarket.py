@@ -25,6 +25,7 @@ def make_settings(**overrides) -> Settings:
         "llm_api_key": None,
         "auth_token": None,
         "request_timeout": 5.0,
+        "cache_path": "/tmp/unused-cache.json",
     }
     return Settings(**{**base, **overrides})
 

@@ -50,6 +50,7 @@ class Settings:
     llm_api_key: str | None
     auth_token: str | None
     request_timeout: float
+    cache_path: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -66,6 +67,7 @@ class Settings:
             llm_api_key=os.getenv("XAI_API_KEY") or os.getenv("TRADING_MCP_LLM_API_KEY"),
             auth_token=os.getenv("TRADING_MCP_AUTH_TOKEN"),
             request_timeout=_env_float("TRADING_MCP_TIMEOUT", 20.0),
+            cache_path=os.getenv("TRADING_MCP_CACHE", ".dependency-cache.json"),
         )
 
     def require_live_credentials(self) -> str:

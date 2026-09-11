@@ -25,12 +25,15 @@ import httpx
 import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from trading_mcp.arbitrage import Constraint, find_arbitrage
+from trading_mcp.arbitrage import Constraint, find_arbitrage, screen_arbitrage
+from trading_mcp.cache import DependencyCache
 from trading_mcp.config import Settings
 from trading_mcp.dependency import constraints_from_valid_outcomes, detect_dependency
 from trading_mcp.polymarket import VALID_SIDES, PolymarketClient
 from trading_mcp.projection import bregman_projection
+from trading_mcp.scan import scan
 from trading_mcp.sizing import kelly_position
+from trading_mcp.sweep import sweep_dependencies
 
 logger = logging.getLogger("trading_mcp")
 
@@ -66,6 +69,7 @@ def anticipated(fn: F) -> F:
 SETTINGS = Settings.from_env()
 CLIENT = PolymarketClient(SETTINGS)
 LLM_HTTP = httpx.AsyncClient(timeout=SETTINGS.request_timeout)
+CACHE = DependencyCache(SETTINGS.cache_path)
 
 
 @contextlib.asynccontextmanager
@@ -238,6 +242,79 @@ async def project_prices(
         b_vector: Right-hand side b.
     """
     return bregman_projection(theta, a_matrix, b_vector)
+
+
+@mcp.tool()
+@anticipated
+async def screen_for_arbitrage(
+    prices: list[float], constraints: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Layer 1: cheaply rule out arbitrage in a cluster using the LP relaxation.
+
+    Far faster than the exact solve and safe to run across every candidate
+    cluster. `arbitrage_possible=false` proves none exists at these prices;
+    `true` means find_arbitrage_basket is worth running.
+
+    Args:
+        prices: Price per outcome token, aligned with the constraint coefficients.
+        constraints: Cover rows from build_dependency_constraints.
+    """
+    return screen_arbitrage(prices, [Constraint.from_dict(raw) for raw in constraints])
+
+
+@mcp.tool()
+@anticipated
+async def scan_for_arbitrage(
+    token_ids: list[str],
+    constraints: list[dict[str, Any]],
+    size: float,
+    labels: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run the full pipeline over one dependency cluster against live books.
+
+    Fetches every leg's book, screens with the LP relaxation, solves exactly,
+    then re-prices the winning basket against real depth at `size`. Reports
+    each layer's result so you can see where an opportunity died, and only sets
+    "tradable" when the edge survives the book.
+
+    Args:
+        token_ids: CLOB token ids, aligned with the constraint coefficients.
+        constraints: Cover rows from build_dependency_constraints.
+        size: Shares per leg to validate against the order book.
+        labels: Optional human-readable names for each token, for the report.
+    """
+    return await scan(
+        CLIENT.fetch_book,
+        token_ids,
+        [Constraint.from_dict(raw) for raw in constraints],
+        size,
+        labels=labels,
+    )
+
+
+@mcp.tool()
+@anticipated
+async def sweep_for_dependencies(
+    markets: list[dict[str, Any]], max_pairs: int = 200, min_shared_terms: int = 2
+) -> dict[str, Any]:
+    """Screen many markets for dependent pairs, using cached verdicts where possible.
+
+    Generates candidate pairs from distinctive shared terms rather than testing
+    every combination, so the model is called on a small fraction of the pairs.
+    Verdicts persist to disk between runs.
+
+    Args:
+        markets: Market dicts with at least "question"; "description" and "outcomes" help.
+        max_pairs: Cap on candidate pairs to screen, strongest first.
+        min_shared_terms: Distinctive terms two markets must share to be a candidate.
+    """
+
+    async def detect(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+        return await detect_dependency(SETTINGS, LLM_HTTP, a, b)
+
+    return await sweep_dependencies(
+        markets, detect, CACHE, max_pairs=max_pairs, min_shared_terms=min_shared_terms
+    )
 
 
 @mcp.tool()

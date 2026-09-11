@@ -107,30 +107,51 @@ def constraints_from_valid_outcomes(
     outcomes_a: list[str],
     outcomes_b: list[str],
 ) -> dict[str, Any]:
-    """Turn a list of jointly possible outcome pairs into solver constraints.
+    """Build the payoff-cover matrix that the arbitrage solver minimizes against.
 
-    The outcome space is flattened to `outcomes_a + outcomes_b`, so index `i`
-    selects an A outcome and index `len(outcomes_a) + j` a B outcome. Each
-    market contributes an "exactly one outcome" equality, and every impossible
-    pair contributes `z_i + z_j <= 1` to forbid selecting both.
+    Each jointly possible outcome pair is a *state of the world*, and each state
+    becomes one row asserting that the basket holds at least one token paying in
+    that state: `A z >= 1`. A basket satisfying every row pays at least $1 no
+    matter how the markets resolve, so any basket costing less than $1 is an
+    arbitrage.
+
+    The token space is `outcomes_a` followed by `outcomes_b`, labelled `A:` and
+    `B:` so identically named outcomes stay distinguishable. Dropping an
+    impossible state drops its row, which is exactly how a dependency creates an
+    arbitrage that neither market shows on its own.
     """
+    if not valid_outcomes:
+        raise ValueError("valid_outcomes is empty: no state of the world is possible")
+
+    index_a = {name: i for i, name in enumerate(outcomes_a)}
+    index_b = {name: len(outcomes_a) + i for i, name in enumerate(outcomes_b)}
     width = len(outcomes_a) + len(outcomes_b)
-    allowed = {(pair[0], pair[1]) for pair in valid_outcomes if len(pair) == 2}
-    constraints: list[dict[str, Any]] = []
 
-    for offset, outcomes in ((0, outcomes_a), (len(outcomes_a), outcomes_b)):
+    rows: list[dict[str, Any]] = []
+    states: list[list[str]] = []
+    for pair in valid_outcomes:
+        if len(pair) != 2:
+            raise ValueError(f"expected [a_outcome, b_outcome] pairs, got {pair!r}")
+        name_a, name_b = pair[0], pair[1]
+        if name_a not in index_a:
+            raise ValueError(f"{name_a!r} is not an outcome of market A ({outcomes_a})")
+        if name_b not in index_b:
+            raise ValueError(f"{name_b!r} is not an outcome of market B ({outcomes_b})")
+
         coeffs = [0.0] * width
-        for index in range(len(outcomes)):
-            coeffs[offset + index] = 1.0
-        constraints.append({"coeffs": coeffs, "b": 1.0, "sense": "=="})
+        coeffs[index_a[name_a]] = 1.0
+        coeffs[index_b[name_b]] = 1.0
+        rows.append({"coeffs": coeffs, "b": 1.0, "sense": ">="})
+        states.append([name_a, name_b])
 
-    for i, name_a in enumerate(outcomes_a):
-        for j, name_b in enumerate(outcomes_b):
-            if (name_a, name_b) in allowed:
-                continue
-            coeffs = [0.0] * width
-            coeffs[i] = 1.0
-            coeffs[len(outcomes_a) + j] = 1.0
-            constraints.append({"coeffs": coeffs, "b": 1.0, "sense": "<="})
-
-    return {"width": width, "labels": list(outcomes_a) + list(outcomes_b), "constraints": constraints}
+    labels = [f"A:{name}" for name in outcomes_a] + [f"B:{name}" for name in outcomes_b]
+    return {
+        "width": width,
+        "labels": labels,
+        "states": states,
+        "constraints": rows,
+        "note": (
+            "One row per jointly possible state. A basket satisfying all rows pays "
+            "at least $1 in every state, so a cost below $1 is an arbitrage."
+        ),
+    }
