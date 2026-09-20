@@ -19,6 +19,7 @@ edge held to resolution is a carry trade, not free money.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,9 +28,38 @@ from typing import Any
 # the model's reading of two prospectuses.
 DEFAULT_MIN_CONFIDENCE = 0.85
 
-# Two markets whose resolution dates are far apart can decouple in the gap: the
-# earlier one resolves on facts that the later one can still overturn.
-DEFAULT_MAX_RESOLUTION_GAP_DAYS = 14.0
+# A gap between resolution dates is only dangerous when the earlier market
+# settles on a *deadline* rather than on the event itself. "Will X win the
+# nomination?" resolves whenever the convention happens and keeps implying the
+# election outcome four months later; "Will X be nominee by June 1?" stops
+# implying anything the moment June 2 arrives. Below this many days apart, even
+# a deadline cannot realistically truncate the implication.
+DEFAULT_DATE_BOUND_GAP_DAYS = 14.0
+
+# Phrasing that ties a resolution to a calendar deadline rather than to the
+# event. A bare year ("the 2028 election") is not a deadline, so a month name or
+# digit must follow the preposition.
+_MONTHS = (
+    "january|february|march|april|may|june|july|august|september|october|november|december"
+)
+_DATE_BOUND_PATTERNS = (
+    rf"\bby\s+(the\s+end\s+of\s+)?({_MONTHS}|\d)",
+    rf"\bbefore\s+({_MONTHS}|\d)",
+    rf"\bas\s+of\s+({_MONTHS}|\d)",
+    r"\bon\s+or\s+before\b",
+    r"\bno\s+later\s+than\b",
+)
+
+
+def looks_date_bounded(market: dict[str, Any]) -> bool:
+    """Detect a resolution tied to a calendar deadline rather than to an event.
+
+    A backstop for the model's own judgement, not a replacement: a deadline in
+    the question text is the signature of the truncation trap, so it is worth
+    catching even when the model reports no risk.
+    """
+    text = f"{market.get('question') or ''} {market.get('description') or ''}".lower()
+    return any(re.search(pattern, text) for pattern in _DATE_BOUND_PATTERNS)
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -63,14 +93,19 @@ def assess_dependency_risk(
     *,
     now: datetime | None = None,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
-    max_resolution_gap_days: float = DEFAULT_MAX_RESOLUTION_GAP_DAYS,
+    date_bound_gap_days: float = DEFAULT_DATE_BOUND_GAP_DAYS,
 ) -> dict[str, Any]:
     """Decide whether a dependency verdict is safe to build a basket on.
 
     Returns `tradable` alongside the reasons against it. `blocking_risks` are
-    disqualifying; `warnings` are things to price in rather than refuse. A
-    verdict the model marked independent is not tradable here — there is no
-    dependency to exploit.
+    disqualifying; `warnings` are things to price in rather than refuse.
+
+    A long gap between resolution dates is a *cost*, reported as capital
+    lockup, not a disqualification — dependent markets are usually months
+    apart, and refusing them outright would reject the whole opportunity set.
+    What disqualifies is *truncation*: the earlier market settling on a
+    deadline that can arrive before the fact determining the later one, which
+    makes an excluded state reachable.
     """
     moment = now or datetime.now(UTC)
     blocking: list[str] = []
@@ -104,19 +139,41 @@ def assess_dependency_risk(
     lockup_days: float | None = None
     if end_a and end_b:
         resolution_gap_days = abs((end_a - end_b).total_seconds()) / 86400.0
-        if resolution_gap_days > max_resolution_gap_days:
-            # The earlier market settles on facts the later one can still change.
-            blocking.append(
-                f"resolution dates are {resolution_gap_days:.0f} days apart: the earlier "
-                "market can settle before the later one's outcome is determined, which "
-                "can make a dropped state reachable"
-            )
         lockup_days = (max(end_a, end_b) - moment).total_seconds() / 86400.0
     else:
         warnings.append("at least one market has no parseable end date; lockup is unknown")
 
     if lockup_days is not None and lockup_days <= 0:
         blocking.append("both markets have already passed their end date")
+
+    truncation = verdict.get("truncation_risk")
+    if isinstance(truncation, dict) and truncation.get("possible"):
+        blocking.append(
+            "model reports the earlier market can resolve before the later one's "
+            f"outcome is determined: {truncation.get('explanation') or 'no explanation given'}"
+        )
+    else:
+        # The trap has a lexical signature. Catch it even when the model missed
+        # it, but only when the dates are far enough apart for it to bite.
+        earlier = market_a if (end_a and end_b and end_a <= end_b) else market_b
+        gap_matters = resolution_gap_days is None or resolution_gap_days > date_bound_gap_days
+        if gap_matters and looks_date_bounded(earlier):
+            blocking.append(
+                "the earlier market resolves on a calendar deadline rather than on the "
+                "event itself, so it can settle before the later market's outcome is "
+                "determined and make an excluded state reachable"
+            )
+        elif truncation is None:
+            warnings.append(
+                "verdict does not address whether the earlier market's resolution date "
+                "can truncate the implication"
+            )
+
+    if lockup_days is not None and resolution_gap_days is not None and resolution_gap_days > 0:
+        warnings.append(
+            f"resolution dates are {resolution_gap_days:.0f} days apart; capital is locked "
+            f"for {lockup_days:.0f} days until the later market settles"
+        )
 
     for label, market in (("A", market_a), ("B", market_b)):
         if not str(market.get("description") or "").strip():

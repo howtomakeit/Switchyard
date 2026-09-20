@@ -3,14 +3,19 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from trading_mcp.risk import annualized_return, assess_dependency_risk, score_opportunity
+from trading_mcp.risk import (
+    annualized_return,
+    assess_dependency_risk,
+    looks_date_bounded,
+    score_opportunity,
+)
 
 NOW = datetime(2028, 1, 1, tzinfo=UTC)
 
 
-def market(end_offset_days, description="a described market"):
+def market(end_offset_days, description="a described market", question="a market"):
     return {
-        "question": "a market",
+        "question": question,
         "description": description,
         "end_date": (NOW + timedelta(days=end_offset_days)).isoformat(),
     }
@@ -23,6 +28,7 @@ def verdict(**overrides):
         "excluded_states": [
             {"state": ["No", "Yes"], "justification": "B's rules require A to have resolved Yes"}
         ],
+        "truncation_risk": {"possible": False, "explanation": "A resolves on the event itself"},
     }
     return {**base, **overrides}
 
@@ -35,14 +41,79 @@ def test_a_well_justified_dependency_is_tradable():
     assert result["capital_lockup_days"] == pytest.approx(35, abs=0.1)
 
 
-def test_far_apart_resolution_dates_block_the_trade():
-    # The nomination/election trap: A settles months before B's outcome exists,
-    # so the excluded state can actually occur.
-    result = assess_dependency_risk(verdict(), market(30), market(200), now=NOW)
+def test_the_canonical_trade_survives_a_months_long_gap():
+    # "Will X win the nomination?" (July) and "Will X win the election?"
+    # (November) are four months apart, but the nomination market resolves on
+    # the event, so the implication holds the whole way. Rejecting this would
+    # reject the entire opportunity set.
+    nomination = market(180, question="Will X win the Republican nomination?")
+    election = market(300, question="Will X win the 2028 presidential election?")
+
+    result = assess_dependency_risk(verdict(), nomination, election, now=NOW)
+
+    assert result["tradable"]
+    assert result["resolution_gap_days"] == pytest.approx(120, abs=0.1)
+    # The gap is priced as a cost, not treated as a disqualification.
+    assert any("capital is locked" in warning for warning in result["warnings"])
+
+
+def test_a_deadline_bounded_earlier_market_is_blocked():
+    # The trap: A settles on a calendar deadline that can arrive before B's
+    # outcome exists, making the excluded state reachable.
+    deadline = market(180, question="Will X be the nominee by June 1?")
+    election = market(300, question="Will X win the 2028 presidential election?")
+
+    result = assess_dependency_risk(verdict(), deadline, election, now=NOW)
 
     assert not result["tradable"]
-    assert any("days apart" in risk for risk in result["blocking_risks"])
-    assert result["resolution_gap_days"] == pytest.approx(170, abs=0.1)
+    assert any("calendar deadline" in risk for risk in result["blocking_risks"])
+
+
+def test_a_model_reported_truncation_blocks_regardless_of_phrasing():
+    risky = verdict(
+        truncation_risk={"possible": True, "explanation": "A closes at the convention date"}
+    )
+
+    result = assess_dependency_risk(risky, market(30), market(200), now=NOW)
+
+    assert not result["tradable"]
+    assert any("can resolve before" in risk for risk in result["blocking_risks"])
+
+
+def test_a_deadline_is_harmless_when_the_markets_resolve_together():
+    # A deadline cannot truncate anything if both markets settle the same week.
+    deadline = market(30, question="Will X be the nominee by June 1?")
+
+    result = assess_dependency_risk(verdict(), deadline, market(33), now=NOW)
+
+    assert result["tradable"]
+
+
+def test_an_unaddressed_truncation_question_warns():
+    silent = verdict()
+    del silent["truncation_risk"]
+
+    result = assess_dependency_risk(silent, market(30), market(33), now=NOW)
+
+    assert result["tradable"]
+    assert any("truncate" in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("text", "bounded"),
+    [
+        ("Will X win the Republican nomination?", False),
+        ("Will X win the 2028 presidential election?", False),
+        ("Will X be the nominee by June 1?", True),
+        ("Will the bill pass before March 2027?", True),
+        ("Will X hold office as of January 20?", True),
+        ("Will the merger close on or before closing?", True),
+        ("Will X resign no later than the deadline?", True),
+        ("Will the vote happen before the convention?", False),
+    ],
+)
+def test_deadline_phrasing_detection(text, bounded):
+    assert looks_date_bounded({"question": text, "description": ""}) is bounded
 
 
 def test_low_confidence_blocks_the_trade():
@@ -141,12 +212,17 @@ def test_scoring_combines_execution_and_resolution_risk():
 
 
 def test_resolution_risk_blocks_an_otherwise_perfect_execution():
-    risk = assess_dependency_risk(verdict(), market(30), market(200), now=NOW)
+    risk = assess_dependency_risk(
+        verdict(truncation_risk={"possible": True, "explanation": "deadline precedes outcome"}),
+        market(30),
+        market(200),
+        now=NOW,
+    )
 
     score = score_opportunity(SCAN, risk)
 
     assert not score["actionable"]
-    assert any("days apart" in reason for reason in score["blocked_by"])
+    assert any("can resolve before" in reason for reason in score["blocked_by"])
 
 
 def test_failed_execution_blocks_a_sound_dependency():

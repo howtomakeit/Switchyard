@@ -96,11 +96,27 @@ this is the failure mode that costs real money:
 > basket pays nothing, and a position entered for a 15¢ edge loses the full 85¢
 > of principal.
 
-`assess_resolution_risk` refuses a verdict unless every exclusion carries a
-resolution-rule justification, confidence clears 0.85, both markets resolve
-within 14 days of each other, and neither has already expired. The detection
-prompt asks for those justifications explicitly and warns the model that an
-unjustified exclusion wipes out the trader.
+The critical distinction is **timing gap vs. truncation**, and conflating them
+breaks the strategy in one direction or the other:
+
+- A **gap** between resolution dates is a *cost*. "Will X win the nomination?"
+  settles at the convention and keeps implying the November outcome four months
+  later. The gap locks your capital; it does not endanger the basket. Dependent
+  markets are nearly always months apart, so refusing them would reject the
+  entire opportunity set.
+- **Truncation** is the *risk*. "Will X be the nominee **by June 1**?" stops
+  implying anything on June 2. That is what makes an excluded state reachable.
+
+`assess_resolution_risk` blocks on truncation, never on gap alone. A verdict is
+refused when the model reports truncation is possible, when the earlier market's
+wording carries a calendar deadline (`by June 1`, `on or before`, `as of March`)
+and the dates are far enough apart for it to bite, when any exclusion lacks a
+resolution-rule justification, when confidence is under 0.85, or when a market
+has expired. Long lockups come back as priced warnings.
+
+The deadline detector is a backstop for the model, not a replacement — it fires
+even when the model reports no risk, because a deadline in the question text is
+the trap's signature. A bare year ("the 2028 election") is not a deadline.
 
 None of this can *prove* a dependency sound. It refuses the ones that are
 plainly unsound and makes the rest legible.

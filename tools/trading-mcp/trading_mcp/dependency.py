@@ -41,11 +41,14 @@ CRITERIA make it unreachable -- not merely when it seems unlikely or when the
 topics are related.
 
 Before excluding a state, check specifically:
-- Do the resolution dates allow the excluded combination? A market resolving
-  earlier can settle on facts the later market later contradicts. If A resolves
-  "X is the nominee ON July 1" and B resolves "X wins in November", then X
-  being nominated on July 15 makes A=No and B=Yes both true, so that state is
-  NOT excludable.
+- TRUNCATION. Does the earlier-resolving market settle on a calendar DEADLINE
+  or on the EVENT itself? "Will X win the nomination?" resolves whenever the
+  convention happens, so it still implies the November outcome and the two
+  dates being months apart is harmless. "Will X be the nominee BY June 1?"
+  stops implying anything on June 2: if X is nominated July 15, A resolves No
+  while B resolves Yes, and the state you excluded actually happens. Markets
+  resolving months apart are normal and fine; a deadline that can arrive
+  before the later market's outcome exists is not.
 - Do both markets resolve from the same source and definition of the event?
 - Does either description contain carve-outs, void conditions, or tie-breaking
   rules that let the combination occur?
@@ -59,7 +62,13 @@ Respond with JSON only, in exactly this shape:
     {{"state": ["A outcome", "B outcome"],
       "justification": "the specific resolution rule making this unreachable"}}
   ],
-  "resolution_risks": ["any way the exclusions could fail"],
+  "resolution_basis": {{"A": "event" or "date", "B": "event" or "date"}},
+  "truncation_risk": {{
+    "possible": true or false,
+    "explanation": "why the earlier market's resolution can or cannot arrive
+                    before the later market's outcome is determined"
+  }},
+  "resolution_risks": ["any other way the exclusions could fail"],
   "confidence": 0.0 to 1.0
 }}
 
@@ -67,9 +76,11 @@ Respond with JSON only, in exactly this shape:
 every pair you removed, each with the resolution rule that rules it out. They
 must together cover all combinations exactly once. If the markets are
 independent, set "dependent" to false, list all pairs in "valid_outcomes", and
-leave "excluded_states" empty. Set "confidence" below 0.85 if you are relying
-on anything other than explicit resolution language. Output no text outside the
-JSON object."""
+leave "excluded_states" empty. "resolution_basis" says whether each market
+settles on a deadline or on the event. "truncation_risk" must always be
+answered, even when both markets resolve on the same day. Set "confidence"
+below 0.85 if you are relying on anything other than explicit resolution
+language. Output no text outside the JSON object."""
 
 
 def _describe(market: dict[str, Any]) -> dict[str, str]:
