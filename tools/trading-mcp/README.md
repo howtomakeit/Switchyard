@@ -25,6 +25,10 @@ by copying this directory.
 | `score_arbitrage_opportunity` | Combine execution + resolution risk; annualize over the lockup |
 | `project_prices` | KL (Bregman) projection of incoherent prices onto the feasible set |
 | `size_position` | Kelly sizing adjusted for fill price and execution probability |
+| `journal_observation` | Record an opportunity — actionable or not — for measurement |
+| `journal_recheck` | Re-observe a basket to measure how long its edge survives |
+| `journal_settlement` | Record what a basket actually paid at resolution |
+| `journal_open` / `journal_report` | What to recheck, and what the data says so far |
 | `get_positions` | Current wallet positions (read-only, no credentials) |
 | `list_open_orders` | Resting orders (live mode) |
 | `cancel_orders` / `cancel_all_orders` | Unwind path for a half-filled basket (live mode) |
@@ -135,6 +139,44 @@ Same headline edge. One is excellent; the other underperforms a savings
 account once you price the resolution risk. Capital is locked until the *later*
 market resolves.
 
+### Measure before you trade
+
+The strategy's expected return cannot be derived from theory. It depends on how
+often real mispricings appear, how much depth they carry, what fraction
+survives the risk gate, and — the question that decides whether a model-paced
+system can trade at all — how long an edge persists before someone else takes
+it. The journal exists to measure those before any capital is at risk.
+
+Record **every** opportunity, including the rejects: the histogram of why
+things fail is the most useful early output.
+
+```
+scan_for_arbitrage → score_arbitrage_opportunity → journal_observation
+                                                   (actionable or not)
+journal_open  → journal_recheck  (on a schedule; this measures edge lifetime)
+at resolution → journal_settlement
+anytime       → journal_report
+```
+
+`journal_report` answers four questions:
+
+| Output | Question it answers |
+|---|---|
+| `actionable_rate` | Are there opportunities at all? |
+| `blocked_by` | What is killing them — no edge, thin books, bad dependencies? |
+| `edge_lifetime_minutes` | Can a system this slow actually capture them? |
+| `settlements.paid_as_promised` | Was the "guaranteed" payoff ever guaranteed? |
+
+That last row is the one that matters most. A cover basket that was genuinely
+risk-free pays at least 1.0 per share. Anything less means an excluded state
+occurred and the dependency was wrong — the loss is the whole position, so a
+settlement rate below 100% invalidates the strategy no matter how good the
+edges looked.
+
+Storage is JSON Lines: append-only, crash-safe, and loadable into pandas
+without a schema migration. A truncated final line costs one record, not the
+history.
+
 ### Sweeping thousands of pairs
 
 Asking a model about every market pair is quadratic: a thousand markets is half
@@ -205,6 +247,7 @@ URL is public from the moment it exists, and these tools can move money.
 | `XAI_API_KEY` | — | API key for that endpoint |
 | `TRADING_MCP_TIMEOUT` | `20` | HTTP timeout in seconds |
 | `TRADING_MCP_CACHE` | `.dependency-cache.json` | Where dependency verdicts persist |
+| `TRADING_MCP_JOURNAL` | `.opportunity-journal.jsonl` | Where observed opportunities are logged |
 | `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB base URL |
 | `POLYMARKET_PRIVATE_KEY` | — | Signing key; required in live mode |
 | `POLYMARKET_FUNDER_ADDRESS` | — | Proxy wallet address, if used |

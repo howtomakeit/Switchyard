@@ -27,6 +27,7 @@ def make_settings(**overrides) -> Settings:
         "auth_token": None,
         "request_timeout": 5.0,
         "cache_path": "/tmp/unused-cache.json",
+        "journal_path": "/tmp/unused-journal.jsonl",
     }
     return Settings(**{**base, **overrides})
 

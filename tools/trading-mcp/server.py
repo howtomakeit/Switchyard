@@ -14,6 +14,7 @@ order is checked against `TRADING_MCP_MAX_ORDER_USD` first.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import functools
 import hmac
@@ -29,6 +30,7 @@ from trading_mcp.arbitrage import Constraint, find_arbitrage, screen_arbitrage
 from trading_mcp.cache import DependencyCache
 from trading_mcp.config import Settings
 from trading_mcp.dependency import constraints_from_valid_outcomes, detect_dependency
+from trading_mcp.journal import Journal
 from trading_mcp.polymarket import VALID_SIDES, PolymarketClient
 from trading_mcp.projection import bregman_projection
 from trading_mcp.risk import assess_dependency_risk, score_opportunity
@@ -71,6 +73,7 @@ SETTINGS = Settings.from_env()
 CLIENT = PolymarketClient(SETTINGS)
 LLM_HTTP = httpx.AsyncClient(timeout=SETTINGS.request_timeout)
 CACHE = DependencyCache(SETTINGS.cache_path)
+JOURNAL = Journal(SETTINGS.journal_path)
 
 
 @contextlib.asynccontextmanager
@@ -404,6 +407,108 @@ async def cancel_all_orders() -> dict[str, Any]:
     """Cancel every resting order for this account. Requires live mode."""
     logger.warning("cancelling ALL live orders")
     return {"result": CLIENT.cancel_all_orders()}
+
+
+@mcp.tool()
+@anticipated
+async def journal_observation(
+    token_ids: list[str],
+    scan_result: dict[str, Any],
+    score: dict[str, Any],
+    labels: list[str] | None = None,
+    risk: dict[str, Any] | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Record an opportunity, actionable or not, for later measurement.
+
+    Record the rejects too: the histogram of why opportunities fail is what
+    tells you whether the strategy is starved of mispricings, of depth, or of
+    trustworthy dependencies.
+
+    Args:
+        token_ids: The basket's CLOB token ids; these identify the opportunity.
+        scan_result: The result from scan_for_arbitrage.
+        score: The result from score_arbitrage_opportunity.
+        labels: Optional human-readable names for the tokens.
+        risk: Optional result from assess_resolution_risk.
+        note: Optional free-text context.
+    """
+    entry = JOURNAL.record_observation(
+        token_ids, scan_result, score, labels=labels, risk=risk, note=note
+    )
+    return {"recorded": entry["kind"], "opportunity": entry["opportunity"], "at": entry["at"]}
+
+
+@mcp.tool()
+@anticipated
+async def journal_recheck(token_ids: list[str], size: float) -> dict[str, Any]:
+    """Re-scan a previously observed basket and record whether its edge survives.
+
+    Repeated over time this measures edge lifetime — the number that decides
+    whether a model-paced system can capture these at all. Schedule it rather
+    than calling it once.
+
+    Args:
+        token_ids: The basket's token ids, as originally recorded.
+        size: Shares per leg to validate against the current book.
+    """
+    quotes = await asyncio.gather(*(CLIENT.quote(token_id) for token_id in token_ids))
+    asks = [q["best_ask"] for q in quotes]
+    still_priced = all(ask is not None for ask in asks)
+    edge = 1.0 - sum(ask for ask in asks if ask is not None) if still_priced else None
+
+    entry = JOURNAL.record_recheck(
+        token_ids, still_tradable=bool(edge is not None and edge > 0), edge_per_share=edge
+    )
+    return {
+        "opportunity": entry["opportunity"],
+        "still_tradable": entry["still_tradable"],
+        "edge_per_share": edge,
+        "size": size,
+    }
+
+
+@mcp.tool()
+@anticipated
+async def journal_settlement(
+    token_ids: list[str], realized_payoff: float, note: str | None = None
+) -> dict[str, Any]:
+    """Record what a basket actually paid at resolution.
+
+    The only honest test of whether a "guaranteed" payoff was guaranteed. A
+    sound cover basket pays at least 1.0 per share; less means an excluded
+    state occurred and the dependency was wrong.
+
+    Args:
+        token_ids: The basket's token ids, as originally recorded.
+        realized_payoff: What the basket actually paid, per share.
+        note: Optional explanation, especially when the payoff fell short.
+    """
+    entry = JOURNAL.record_settlement(token_ids, realized_payoff=realized_payoff, note=note)
+    return {"opportunity": entry["opportunity"], "paid_as_promised": entry["paid_as_promised"]}
+
+
+@mcp.tool()
+@anticipated
+async def journal_open() -> dict[str, Any]:
+    """List observed baskets that are neither settled nor known dead.
+
+    These are what a scheduled recheck should look at again.
+    """
+    rows = JOURNAL.open_opportunities()
+    return {"count": len(rows), "opportunities": rows}
+
+
+@mcp.tool()
+@anticipated
+async def journal_report() -> dict[str, Any]:
+    """Summarize what the journal says about the strategy so far.
+
+    Reports the actionable rate, what is blocking the rest, the edge and
+    capital distributions, how long edges survive, and whether settled baskets
+    paid what they promised.
+    """
+    return JOURNAL.stats()
 
 
 @mcp.tool()

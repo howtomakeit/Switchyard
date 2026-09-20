@@ -54,6 +54,7 @@ class Settings:
     auth_token: str | None
     request_timeout: float
     cache_path: str
+    journal_path: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -72,6 +73,7 @@ class Settings:
             auth_token=os.getenv("TRADING_MCP_AUTH_TOKEN"),
             request_timeout=_env_float("TRADING_MCP_TIMEOUT", 20.0),
             cache_path=os.getenv("TRADING_MCP_CACHE", ".dependency-cache.json"),
+            journal_path=os.getenv("TRADING_MCP_JOURNAL", ".opportunity-journal.jsonl"),
         )
 
     def require_live_credentials(self) -> str:
