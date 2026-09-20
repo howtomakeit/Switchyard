@@ -17,6 +17,7 @@ def make_settings(**overrides) -> Settings:
         "live": False,
         "max_order_usd": 50.0,
         "clob_url": "https://clob.test",
+        "data_url": "https://data.test",
         "private_key": None,
         "funder_address": None,
         "signature_type": 0,
@@ -127,3 +128,46 @@ def test_live_mode_without_a_key_is_rejected():
 
     with pytest.raises(RuntimeError, match="POLYMARKET_PRIVATE_KEY"):
         client.place_live_order("tok-1", "buy", 0.5, 10.0)
+
+
+@respx.mock
+async def test_positions_are_read_without_credentials(client):
+    respx.get("https://data.test/positions").mock(
+        return_value=httpx.Response(
+            200, json=[{"asset": "tok-1", "size": "12.5", "avgPrice": "0.44"}]
+        )
+    )
+
+    positions = await client.positions("0xabc")
+
+    assert positions == [{"asset": "tok-1", "size": "12.5", "avgPrice": "0.44"}]
+    await client.aclose()
+
+
+@respx.mock
+async def test_positions_tolerates_a_wrapped_payload(client):
+    respx.get("https://data.test/positions").mock(
+        return_value=httpx.Response(200, json={"data": [{"asset": "tok-1"}]})
+    )
+
+    assert await client.positions("0xabc") == [{"asset": "tok-1"}]
+    await client.aclose()
+
+
+def test_cancelling_requires_live_mode(client):
+    with pytest.raises(RuntimeError, match="live trading is disabled"):
+        client.cancel_orders(["order-1"])
+    with pytest.raises(RuntimeError, match="live trading is disabled"):
+        client.cancel_all_orders()
+
+
+def test_listing_open_orders_requires_live_mode(client):
+    with pytest.raises(RuntimeError, match="live trading is disabled"):
+        client.open_orders()
+
+
+def test_cancelling_nothing_is_rejected_before_touching_the_venue():
+    live = PolymarketClient(make_settings(live=True, private_key="0xkey"))
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        live.cancel_orders([])

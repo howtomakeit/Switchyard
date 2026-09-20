@@ -39,6 +39,7 @@ class PolymarketClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._http = httpx.AsyncClient(timeout=settings.request_timeout)
+        self._clob: Any = None
 
     async def aclose(self) -> None:
         """Release the underlying connection pool."""
@@ -87,20 +88,19 @@ class PolymarketClient:
         taking_asks = side == "buy"
         return simulate_fill(asks if taking_asks else bids, size, taking_asks=taking_asks)
 
-    def place_live_order(
-        self, token_id: str, side: str, price: float, size: float
-    ) -> dict[str, Any]:
-        """Sign and post a real limit order through `py-clob-client`.
+    def _signing_client(self) -> Any:
+        """Build (once) the authenticated client that signs and posts orders.
 
         Imported lazily so the whole server does not require the signing stack
-        (and its web3 dependency tree) just to serve quotes in paper mode.
+        (and its web3 dependency tree) just to serve quotes in paper mode, and
+        cached because deriving API credentials costs a round trip.
         """
         key = self._settings.require_live_credentials()
+        if self._clob is not None:
+            return self._clob
 
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import OrderArgs
-            from py_clob_client.order_builder.constants import BUY, SELL
         except ImportError as exc:  # pragma: no cover - exercised only in live mode
             raise RuntimeError(
                 "live trading requires py-clob-client; install it with "
@@ -115,6 +115,17 @@ class PolymarketClient:
             funder=self._settings.funder_address,
         )
         client.set_api_creds(client.create_or_derive_api_creds())
+        self._clob = client
+        return client
+
+    def place_live_order(
+        self, token_id: str, side: str, price: float, size: float
+    ) -> dict[str, Any]:
+        """Sign and post a real limit order through `py-clob-client`."""
+        client = self._signing_client()
+
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.order_builder.constants import BUY, SELL
 
         order = client.create_order(
             OrderArgs(
@@ -125,3 +136,40 @@ class PolymarketClient:
             )
         )
         return dict(client.post_order(order))
+
+    def cancel_orders(self, order_ids: list[str]) -> dict[str, Any]:
+        """Cancel specific resting orders.
+
+        The unwind path for a partially filled basket: when one leg fails, the
+        remaining resting legs must come off the book before they fill into an
+        unhedged position.
+        """
+        if not order_ids:
+            raise ValueError("order_ids must not be empty")
+        return dict(self._signing_client().cancel_orders(order_ids))
+
+    def cancel_all_orders(self) -> dict[str, Any]:
+        """Cancel every resting order for this account.
+
+        The blunt instrument, for when a basket has gone wrong and identifying
+        individual legs is slower than standing fully down.
+        """
+        return dict(self._signing_client().cancel_all())
+
+    def open_orders(self) -> list[dict[str, Any]]:
+        """List this account's resting orders."""
+        return [dict(order) for order in self._signing_client().get_orders()]
+
+    async def positions(self, address: str) -> list[dict[str, Any]]:
+        """Fetch current positions for a wallet from the public data API.
+
+        Read-only and unauthenticated, so this works in paper mode too — useful
+        for confirming what a live basket actually left you holding.
+        """
+        response = await self._http.get(
+            f"{self._settings.data_url}/positions", params={"user": address}
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload if isinstance(payload, list) else payload.get("data", [])
+        return [dict(row) for row in rows]

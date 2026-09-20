@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 # Polymarket's CLOB serves quotes, books, and order placement.
 DEFAULT_CLOB_URL = "https://clob.polymarket.com"
+# The public data API serves positions and needs no credentials.
+DEFAULT_DATA_URL = "https://data-api.polymarket.com"
 DEFAULT_LLM_URL = "https://api.x.ai/v1"
 DEFAULT_LLM_MODEL = "grok-4"
 
@@ -42,6 +44,7 @@ class Settings:
     live: bool
     max_order_usd: float
     clob_url: str
+    data_url: str
     private_key: str | None
     funder_address: str | None
     signature_type: int
@@ -59,6 +62,7 @@ class Settings:
             live=os.getenv("TRADING_MCP_MODE", "paper").strip().lower() == "live",
             max_order_usd=_env_float("TRADING_MCP_MAX_ORDER_USD", 50.0),
             clob_url=os.getenv("POLYMARKET_CLOB_URL", DEFAULT_CLOB_URL).rstrip("/"),
+            data_url=os.getenv("POLYMARKET_DATA_URL", DEFAULT_DATA_URL).rstrip("/"),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY"),
             funder_address=os.getenv("POLYMARKET_FUNDER_ADDRESS"),
             signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),

@@ -17,17 +17,26 @@ by copying this directory.
 | `place_order` | Place a limit order — simulated unless the server runs in live mode |
 | `sweep_for_dependencies` | Screen many markets for dependent pairs, with caching |
 | `detect_market_dependency` | Ask a reasoning model whether two markets are logically dependent |
+| `assess_resolution_risk` | Refuse a dependency whose exclusions could actually occur |
 | `build_dependency_constraints` | Turn valid outcome pairs into the payoff-cover matrix |
 | `screen_for_arbitrage` | Layer 1: rule out arbitrage cheaply with the LP relaxation |
 | `find_arbitrage_basket` | Layer 2: cheapest covering basket, exactly, via OR-Tools/SCIP |
 | `scan_for_arbitrage` | All three layers against live books, in one call |
+| `score_arbitrage_opportunity` | Combine execution + resolution risk; annualize over the lockup |
 | `project_prices` | KL (Bregman) projection of incoherent prices onto the feasible set |
 | `size_position` | Kelly sizing adjusted for fill price and execution probability |
+| `get_positions` | Current wallet positions (read-only, no credentials) |
+| `list_open_orders` | Resting orders (live mode) |
+| `cancel_orders` / `cancel_all_orders` | Unwind path for a half-filled basket (live mode) |
 
-The intended flow is `sweep_for_dependencies` → `build_dependency_constraints`
-→ `scan_for_arbitrage` → `place_order` on each leg. `scan_for_arbitrage` runs
-the whole pipeline itself; the individual layer tools exist for when you want
-to drive it step by step.
+The intended flow is `sweep_for_dependencies` → `assess_resolution_risk` →
+`build_dependency_constraints` → `scan_for_arbitrage` →
+`score_arbitrage_opportunity` → `place_order` on each leg.
+`scan_for_arbitrage` runs the three solver layers itself; the individual layer
+tools exist for when you want to drive it step by step.
+
+**Do not skip `assess_resolution_risk`.** It is the difference between an
+arbitrage and an unhedged bet — see below.
 
 ## How the arbitrage is found
 
@@ -74,6 +83,42 @@ costs exactly 1.00, and the edge vanishes. Both cases are pinned in
    is not a hedged position, it is naked exposure on whichever legs did fill —
    so a short leg rejects the trade rather than scaling it down.
 
+### Resolution risk — where this loses money
+
+A cover basket is risk-free only if the dropped states are unreachable **under
+the markets' own resolution rules**. Semantic implication is not enough, and
+this is the failure mode that costs real money:
+
+> "Will X be the nominee **on July 1**?" and "Will X win the **November**
+> election?" look strictly implied — you cannot win without the nomination — so
+> a model drops the `(No, Yes)` state. But if X is nominated on July 15, market
+> A resolves No while B still resolves Yes. The dropped state happens, the
+> basket pays nothing, and a position entered for a 15¢ edge loses the full 85¢
+> of principal.
+
+`assess_resolution_risk` refuses a verdict unless every exclusion carries a
+resolution-rule justification, confidence clears 0.85, both markets resolve
+within 14 days of each other, and neither has already expired. The detection
+prompt asks for those justifications explicitly and warns the model that an
+unjustified exclusion wipes out the trader.
+
+None of this can *prove* a dependency sound. It refuses the ones that are
+plainly unsound and makes the rest legible.
+
+### Edges are carry trades, not free money
+
+`score_arbitrage_opportunity` annualizes the edge over the capital lockup,
+because the two numbers tell opposite stories:
+
+| Edge | Cost | Lockup | Period return | Annualized |
+|---|---|---|---|---|
+| 15¢ | 85¢ | 35 days | 17.6% | **184%** |
+| 15¢ | 85¢ | 659 days | 17.6% | **9.8%** |
+
+Same headline edge. One is excellent; the other underperforms a savings
+account once you price the resolution risk. Capital is locked until the *later*
+market resolves.
+
 ### Sweeping thousands of pairs
 
 Asking a model about every market pair is quadratic: a thousand markets is half
@@ -86,6 +131,22 @@ by market text.
 On a 440-market synthetic set (96,580 possible pairs) with 360 genuinely
 dependent pairs, candidate generation takes 20 ms and ranks all 360 true pairs
 above every false one: **100% recall at 360 model calls, a 268× reduction**.
+
+## Verify before you trade
+
+The Polymarket wire format is the one thing mocks cannot prove. Run this
+wherever outbound access to `polymarket.com` is allowed:
+
+```bash
+python verify_live.py
+```
+
+It is read-only, needs no credentials, and checks every assumption the server
+makes: that Gamma returns the fields we read, that `clobTokenIds` parses, that
+book levels carry string `price`/`size`, what order the venue actually returns
+levels in, that our derived mid matches the venue's own `/midpoint`, and that
+depth simulation against a real book stays self-consistent. It exits non-zero
+on any failure, so it can gate a deploy.
 
 ## Setup
 
@@ -167,11 +228,17 @@ pure computation and tested directly.
 - **The Polymarket request/response shapes are not verified against the live
   API.** They were written from the documented CLOB schema and covered with
   mocks. Run `get_market_price` against a real token id before trusting it.
-- `place_order` places orders but does not track, amend, or cancel them. There
-  is no position or P&L state anywhere in this server. **This matters most for
-  multi-leg baskets**: if leg 2 fails after leg 1 fills, you hold unhedged
-  exposure and must unwind by hand. `scan_for_arbitrage` checks every leg's
-  depth before you trade, which reduces the risk but does not remove it.
+- **Multi-leg execution is not atomic.** `scan_for_arbitrage` checks every
+  leg's depth first and `cancel_orders` gives you an unwind path, but between
+  placing leg 1 and leg 2 the book can move. Nothing here makes a basket fill
+  all-or-nothing; that risk is real and unhedged. Place the least liquid leg
+  first.
+- There is no P&L or position state beyond what `get_positions` reads back from
+  the venue.
+- The order-lifecycle calls (`cancel_orders`, `list_open_orders`) are thin
+  passthroughs to `py-clob-client` and are **not** covered by `verify_live.py`,
+  which is read-only. Test them with one tiny resting order before relying on
+  them to unwind anything.
 - No Frank-Wolfe / Gurobi layer. The LP relaxation already gives a sound bound
   for Layer 1 and SCIP solves these clusters exactly in milliseconds, so the
   extra layer would add a licensed dependency for no accuracy.

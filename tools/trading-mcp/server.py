@@ -31,6 +31,7 @@ from trading_mcp.config import Settings
 from trading_mcp.dependency import constraints_from_valid_outcomes, detect_dependency
 from trading_mcp.polymarket import VALID_SIDES, PolymarketClient
 from trading_mcp.projection import bregman_projection
+from trading_mcp.risk import assess_dependency_risk, score_opportunity
 from trading_mcp.scan import scan
 from trading_mcp.sizing import kelly_position
 from trading_mcp.sweep import sweep_dependencies
@@ -315,6 +316,94 @@ async def sweep_for_dependencies(
     return await sweep_dependencies(
         markets, detect, CACHE, max_pairs=max_pairs, min_shared_terms=min_shared_terms
     )
+
+
+@mcp.tool()
+@anticipated
+async def assess_resolution_risk(
+    verdict: dict[str, Any], market_a: dict[str, Any], market_b: dict[str, Any]
+) -> dict[str, Any]:
+    """Check whether a dependency verdict is safe to build a basket on.
+
+    A cover basket is only risk-free if the states the solver dropped are
+    unreachable under the markets' own resolution rules. This refuses the
+    verdict unless every exclusion was justified, confidence is high, and the
+    two markets resolve on compatible dates, and reports the capital lockup.
+
+    Call this between detect_market_dependency and build_dependency_constraints.
+
+    Args:
+        verdict: The result from detect_market_dependency.
+        market_a: Market A, ideally including "end_date" and "description".
+        market_b: Market B, in the same shape.
+    """
+    return assess_dependency_risk(verdict, market_a, market_b)
+
+
+@mcp.tool()
+@anticipated
+async def score_arbitrage_opportunity(
+    scan_result: dict[str, Any], risk: dict[str, Any], bankroll: float | None = None
+) -> dict[str, Any]:
+    """Combine an execution-validated scan with its resolution risk into a decision.
+
+    Returns "actionable" only when the order book supports the trade and the
+    dependency survives scrutiny, and annualizes the edge over the capital
+    lockup — a fat edge held for two years can be worse than a thin one held
+    for a month.
+
+    Args:
+        scan_result: The result from scan_for_arbitrage.
+        risk: The result from assess_resolution_risk.
+        bankroll: Optional capital available, to check the basket is affordable.
+    """
+    return score_opportunity(scan_result, risk, bankroll=bankroll)
+
+
+@mcp.tool()
+@anticipated
+async def get_positions(address: str) -> dict[str, Any]:
+    """List current token positions for a wallet.
+
+    Read-only and unauthenticated, so it works in paper mode. Use it to confirm
+    what a basket actually left you holding.
+
+    Args:
+        address: The wallet address to look up.
+    """
+    rows = await CLIENT.positions(address)
+    return {"address": address, "count": len(rows), "positions": rows}
+
+
+@mcp.tool()
+@anticipated
+async def list_open_orders() -> dict[str, Any]:
+    """List this account's resting orders. Requires live mode."""
+    orders = CLIENT.open_orders()
+    return {"count": len(orders), "orders": orders}
+
+
+@mcp.tool()
+@anticipated
+async def cancel_orders(order_ids: list[str]) -> dict[str, Any]:
+    """Cancel specific resting orders. Requires live mode.
+
+    The unwind path when one leg of a basket fails: take the remaining resting
+    legs off the book before they fill into an unhedged position.
+
+    Args:
+        order_ids: Order ids to cancel.
+    """
+    logger.warning("cancelling %d live order(s)", len(order_ids))
+    return {"cancelled": order_ids, "result": CLIENT.cancel_orders(order_ids)}
+
+
+@mcp.tool()
+@anticipated
+async def cancel_all_orders() -> dict[str, Any]:
+    """Cancel every resting order for this account. Requires live mode."""
+    logger.warning("cancelling ALL live orders")
+    return {"result": CLIENT.cancel_all_orders()}
 
 
 @mcp.tool()

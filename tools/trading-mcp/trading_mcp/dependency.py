@@ -20,30 +20,56 @@ import httpx
 
 from .config import Settings
 
-_PROMPT = """You analyze prediction markets for logical dependencies.
+_PROMPT = """You analyze prediction markets for logical dependencies that survive
+their own resolution rules.
 
 Market A: {a_question}
 A description: {a_description}
 A outcomes: {a_outcomes}
+A resolution date: {a_end}
 
 Market B: {b_question}
 B description: {b_description}
 B outcomes: {b_outcomes}
+B resolution date: {b_end}
 
-Decide whether the resolutions of A and B are logically dependent — that is,
-whether some combination of their outcomes is impossible or forced.
+A trader will buy a basket of outcome tokens chosen so that at least one pays
+out in every state you leave possible. Every state you exclude removes a
+safeguard. If you exclude a state that can actually occur, the trader loses
+their entire stake, so exclude a state only when the two markets' RESOLUTION
+CRITERIA make it unreachable -- not merely when it seems unlikely or when the
+topics are related.
+
+Before excluding a state, check specifically:
+- Do the resolution dates allow the excluded combination? A market resolving
+  earlier can settle on facts the later market later contradicts. If A resolves
+  "X is the nominee ON July 1" and B resolves "X wins in November", then X
+  being nominated on July 15 makes A=No and B=Yes both true, so that state is
+  NOT excludable.
+- Do both markets resolve from the same source and definition of the event?
+- Does either description contain carve-outs, void conditions, or tie-breaking
+  rules that let the combination occur?
 
 Respond with JSON only, in exactly this shape:
 {{
   "dependent": true or false,
-  "relation": "short description of the logical relation, or null",
+  "relation": "the logical relation in one sentence, or null",
   "valid_outcomes": [["A outcome", "B outcome"], ...],
+  "excluded_states": [
+    {{"state": ["A outcome", "B outcome"],
+      "justification": "the specific resolution rule making this unreachable"}}
+  ],
+  "resolution_risks": ["any way the exclusions could fail"],
   "confidence": 0.0 to 1.0
 }}
 
-"valid_outcomes" must list every jointly possible pair and omit impossible
-ones. If the markets are independent, set "dependent" to false and list all
-pairs. Do not include any text outside the JSON object."""
+"valid_outcomes" lists every jointly possible pair; "excluded_states" lists
+every pair you removed, each with the resolution rule that rules it out. They
+must together cover all combinations exactly once. If the markets are
+independent, set "dependent" to false, list all pairs in "valid_outcomes", and
+leave "excluded_states" empty. Set "confidence" below 0.85 if you are relying
+on anything other than explicit resolution language. Output no text outside the
+JSON object."""
 
 
 def _describe(market: dict[str, Any]) -> dict[str, str]:
@@ -52,6 +78,7 @@ def _describe(market: dict[str, Any]) -> dict[str, str]:
         "question": str(market.get("question") or market.get("description") or "unknown"),
         "description": str(market.get("description") or ""),
         "outcomes": json.dumps(market.get("outcomes") or ["Yes", "No"]),
+        "end": str(market.get("end_date") or market.get("endDate") or "unknown"),
     }
 
 
@@ -77,9 +104,11 @@ async def detect_dependency(
         a_question=a["question"],
         a_description=a["description"],
         a_outcomes=a["outcomes"],
+        a_end=a["end"],
         b_question=b["question"],
         b_description=b["description"],
         b_outcomes=b["outcomes"],
+        b_end=b["end"],
     )
 
     response = await http.post(
